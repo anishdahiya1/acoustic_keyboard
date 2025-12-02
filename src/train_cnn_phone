@@ -1,0 +1,224 @@
+# src/train_cnn_phone.py
+import os, json, time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import librosa
+
+# ---------------- Config (keeps same good settings as your tuned model) ----------------
+SAMPLE_RATE = 48000
+N_MFCC = 40
+N_FFT = 1024
+HOP_LENGTH = 128
+MAX_FRAMES = 120
+BATCH_SIZE = 32
+LR = 1e-3
+WEIGHT_DECAY = 1e-4
+EPOCHS = 20
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SEED = 42
+PHONE_TENSORS = "artifacts/phone_keystrokes_tensors.pt"
+PHONE_META = "artifacts/phone_keystrokes_meta.csv"
+OUT_MODEL = "artifacts/cnn_phone.pt"
+OUT_LOG = "artifacts/cnn_phone_log.json"
+os.makedirs("artifacts", exist_ok=True)
+# ---------------------------------------------------------------------------------------
+
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
+# ---- helpers: mfcc + delta stack (same as training pipeline) ----
+def compute_mfcc_seq(signal, sr=SAMPLE_RATE, n_mfcc=N_MFCC, n_fft=N_FFT, hop_length=HOP_LENGTH, max_frames=MAX_FRAMES):
+    mf = librosa.feature.mfcc(y=signal, sr=sr, n_mfcc=n_mfcc, n_fft=n_fft, hop_length=hop_length)
+    d1 = librosa.feature.delta(mf, order=1)
+    d2 = librosa.feature.delta(mf, order=2)
+    def pad_trunc(arr):
+        if arr.shape[1] < max_frames:
+            pad_width = max_frames - arr.shape[1]
+            return np.pad(arr, ((0,0),(0,pad_width)), mode='constant', constant_values=0.0)
+        else:
+            return arr[:, :max_frames]
+    mf = pad_trunc(mf); d1 = pad_trunc(d1); d2 = pad_trunc(d2)
+    stacked = np.vstack([mf, d1, d2])
+    stacked = (stacked - stacked.mean(axis=1, keepdims=True)) / (stacked.std(axis=1, keepdims=True) + 1e-9)
+    return stacked.astype(np.float32)
+
+# ---- Dataset class ----
+class KeystrokeDataset(Dataset):
+    def __init__(self, X, y, precompute=False, augment=False):
+        self.X = X.astype(np.float32)
+        self.y = y.astype(np.int64)
+        self.precompute = precompute
+        self.augment = augment
+        if precompute:
+            self.mfccs = [compute_mfcc_seq(x) for x in self.X]
+        else:
+            self.mfccs = None
+    def __len__(self): return len(self.X)
+    def __getitem__(self, idx):
+        if self.precompute:
+            mf = self.mfccs[idx]
+        else:
+            x = self.X[idx]
+            # optional tiny augment for train-time
+            if self.augment:
+                # small random roll + noise + gain
+                shift = np.random.randint(-int(0.005*SAMPLE_RATE), int(0.005*SAMPLE_RATE)+1)
+                if shift != 0:
+                    x = np.roll(x, shift)
+                    if shift>0: x[:shift]=0.0
+                    else: x[shift:]=0.0
+                noise = np.random.normal(0, np.random.uniform(0.0,0.002), size=x.shape).astype(np.float32)
+                x = np.clip(x + noise, -1.0, 1.0) * np.random.uniform(0.95,1.05)
+            mf = compute_mfcc_seq(x)
+        return torch.from_numpy(mf), torch.tensor(self.y[idx], dtype=torch.long)
+
+# ---- Model: same SimpleCNN (channels = N_MFCC * 3) ----
+class SimpleCNN(nn.Module):
+    def __init__(self, n_mfcc=N_MFCC, n_frames=MAX_FRAMES, n_classes=36):
+        super().__init__()
+        in_ch = n_mfcc * 3
+        self.conv1 = nn.Conv1d(in_channels=in_ch, out_channels=128, kernel_size=5, padding=2)
+        self.bn1 = nn.BatchNorm1d(128)
+        self.pool1 = nn.MaxPool1d(2)
+        self.conv2 = nn.Conv1d(128, 256, kernel_size=5, padding=2)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.pool2 = nn.MaxPool1d(2)
+        def out_frames(frames):
+            f = frames
+            f = f // 2
+            f = f // 2
+            return f
+        out_t = out_frames(n_frames)
+        self.fc1 = nn.Linear(256 * out_t, 512)
+        self.dropout = nn.Dropout(0.4)
+        self.fc2 = nn.Linear(512, n_classes)
+    def forward(self, x):
+        x = self.conv1(x); x = self.bn1(x); x = torch.relu(x); x = self.pool1(x)
+        x = self.conv2(x); x = self.bn2(x); x = torch.relu(x); x = self.pool2(x)
+        x = x.view(x.size(0), -1)
+        x = torch.relu(self.fc1(x)); x = self.dropout(x)
+        x = self.fc2(x)
+        return x
+
+# ---- pipeline: load tensors & meta, convert to numpy, split ----
+def prepare_phone_npz():
+    import torch as th
+    import pandas as pd
+    tens = th.load(PHONE_TENSORS)  # list of tensors shape (1,L)
+    meta = pd.read_csv(PHONE_META)
+    X_list = []
+    # target fixed length (samples) used elsewhere in the repo
+    TARGET_LEN = 14400
+    lengths = []
+    for t in tens:
+        if t.ndim == 2 and t.shape[0] == 1:
+            arr = t.squeeze(0).numpy()
+        else:
+            arr = t.numpy()
+        arr = arr.astype(np.float32)
+        lengths.append(arr.shape[0])
+        # pad or truncate to TARGET_LEN
+        if arr.shape[0] < TARGET_LEN:
+            pad_width = TARGET_LEN - arr.shape[0]
+            arr = np.pad(arr, (0, pad_width), mode='constant', constant_values=0.0)
+        elif arr.shape[0] > TARGET_LEN:
+            arr = arr[:TARGET_LEN]
+        X_list.append(arr)
+    X = np.stack(X_list, axis=0)   # (N, TARGET_LEN)
+    print('Phone raw lengths stats -> min', np.min(lengths), 'max', np.max(lengths), 'median', np.median(lengths))
+    # per-sample peak normalize
+    eps = 1e-9
+    X = X / (np.max(np.abs(X), axis=1, keepdims=True) + eps)
+    y = meta['Key'].astype(np.int64).to_numpy()
+    # shuffle + split 80/10/10
+    rng = np.random.default_rng(SEED)
+    perm = rng.permutation(X.shape[0])
+    X = X[perm]; y = y[perm]
+    N = X.shape[0]; n_train = int(0.8*N); n_val = int(0.1*N); n_test = N - n_train - n_val
+    X_train = X[:n_train]; y_train = y[:n_train]
+    X_val = X[n_train:n_train+n_val]; y_val = y[n_train:n_train+n_val]
+    X_test = X[n_train+n_val:]; y_test = y[n_train+n_val:]
+    np.savez_compressed("artifacts/phone_dataset_npz.npz",
+                        X_train=X_train, y_train=y_train,
+                        X_val=X_val, y_val=y_val,
+                        X_test=X_test, y_test=y_test)
+    print("Prepared phone_dataset_npz.npz ->", X_train.shape, X_val.shape, X_test.shape)
+    return "artifacts/phone_dataset_npz.npz"
+
+# ---- training loop ----
+def evaluate(model, loader, device):
+    model.eval(); preds=[]; trues=[]
+    with torch.no_grad():
+        for x,y in loader:
+            x = x.to(device); y=y.to(device)
+            out = model(x)
+            preds.append(out.argmax(dim=1).cpu().numpy()); trues.append(y.cpu().numpy())
+    return np.concatenate(preds), np.concatenate(trues)
+
+def train():
+    npz = prepare_phone_npz()
+    data = np.load(npz)
+    X_train,y_train = data["X_train"], data["y_train"]
+    X_val,y_val = data["X_val"], data["y_val"]
+    X_test,y_test = data["X_test"], data["y_test"]
+    n_classes = int(max(y_train.max(), y_val.max(), y_test.max()) + 1)
+
+    train_ds = KeystrokeDataset(X_train, y_train, precompute=False, augment=True)
+    val_ds = KeystrokeDataset(X_val, y_val, precompute=False, augment=False)
+    test_ds = KeystrokeDataset(X_test, y_test, precompute=False, augment=False)
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=1, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=1, pin_memory=True)
+
+    model = SimpleCNN(n_mfcc=N_MFCC, n_frames=MAX_FRAMES, n_classes=n_classes).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    criterion = nn.CrossEntropyLoss()
+
+    best_val = 0.0; history = {"train_acc":[], "val_acc":[], "test_acc":[], "times":[]}
+    for epoch in range(1, EPOCHS+1):
+        model.train(); t0=time.time()
+        all_preds = []; all_trues = []
+        for x,y in train_loader:
+            x = x.to(DEVICE); y = y.to(DEVICE)
+            optimizer.zero_grad()
+            out = model(x)
+            loss = criterion(out, y)
+            loss.backward(); optimizer.step()
+            all_preds.append(out.argmax(dim=1).detach().cpu().numpy()); all_trues.append(y.cpu().numpy())
+        train_preds = np.concatenate(all_preds); train_trues = np.concatenate(all_trues)
+        train_acc = (train_preds == train_trues).mean()
+        val_preds, val_trues = evaluate(model, val_loader, DEVICE)
+        val_acc = (val_preds == val_trues).mean()
+        test_preds, test_trues = evaluate(model, test_loader, DEVICE)
+        test_acc = (test_preds == test_trues).mean()
+        epoch_time = time.time() - t0
+        history["train_acc"].append(train_acc); history["val_acc"].append(val_acc); history["test_acc"].append(test_acc); history["times"].append(epoch_time)
+        print(f"Epoch {epoch}/{EPOCHS} train_acc={train_acc:.4f} val_acc={val_acc:.4f} test_acc={test_acc:.4f} time={epoch_time:.1f}s")
+        if val_acc > best_val:
+            best_val = val_acc
+            torch.save({"model_state": model.state_dict(), "epoch": epoch, "val_acc": val_acc, "test_acc": test_acc}, OUT_MODEL)
+            print(" Saved best ->", OUT_MODEL)
+    # final eval
+    # load checkpoint with PyTorch 2.6+ compatibility (weights_only defaults changed)
+    try:
+        ckpt = torch.load(OUT_MODEL, map_location=DEVICE, weights_only=False)
+    except TypeError:
+        # older torch versions don't accept weights_only
+        ckpt = torch.load(OUT_MODEL, map_location=DEVICE)
+    except Exception:
+        # final fallback: try without weights_only
+        ckpt = torch.load(OUT_MODEL, map_location=DEVICE)
+    model.load_state_dict(ckpt["model_state"])
+    final_preds, final_trues = evaluate(model, test_loader, DEVICE)
+    final_acc = (final_preds == final_trues).mean()
+    print("Final test acc (phone):", final_acc)
+    with open(OUT_LOG, "w") as f:
+        json.dump(history, f, indent=2)
+    print("Saved log ->", OUT_LOG)
+
+if __name__ == "__main__":
+    train()

@@ -1,0 +1,31 @@
+name: Build Docker image
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build image
+        run: |
+          docker build -t keystroke-demo:latest .
+
+      - name: Save image to tar
+        run: |
+          docker save keystroke-demo:latest -o keystroke-demo.tar
+
+      - name: Upload image tar
+        uses: actions/upload-artifact@v4
+        with:
+          name: keystroke-demo-image
+          path: keystroke-demo.tar

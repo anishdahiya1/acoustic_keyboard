@@ -1,0 +1,10 @@
+venv
+.venv
+__pycache__
+*.pyc
+.git
+artifacts/phone_dataset_npz.npz
+artifacts/zoom_dataset_npz.npz
+outputs
+debug_uploaded
+*.zip
